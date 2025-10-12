@@ -1,12 +1,20 @@
 # Build results
-/bin/
-/obj/
+**/bin/
+**/obj/
 
 # Visual Studio & Rider
 .vs/
 .idea/
 *.user
 *.suo
+*.userosscache
+*.sln.docstates
+
+**/appsettings.Development.json
+
+*.nupkg
+packages/
+*.snupkg
 
 # Logs
 *.log
