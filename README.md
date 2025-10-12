@@ -23,7 +23,7 @@ The **Authentication API** provides authentication and authorization solution wi
 ---
 
 ## Tech Stack
-- **.NET 8 / ASP.NET Core Web API**
+- **.NET 8**
 - **Entity Framework Core 8**
 - **SQL Server**
 - **JWT**
