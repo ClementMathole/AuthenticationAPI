@@ -1,0 +1,15 @@
+.git/
+.github/
+.vs/
+.idea/
+
+**/bin/
+**/obj/
+
+.env
+.env.*
+**/appsettings.*.json
+
+*.user
+*.suo
+*.log

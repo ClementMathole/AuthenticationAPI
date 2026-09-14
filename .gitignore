@@ -1,3 +1,12 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Environment-specific ASP.NET configuration
+**/appsettings.*.json
+!**/appsettings.json
+
 # Build results
 **/bin/
 **/obj/

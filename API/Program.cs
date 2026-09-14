@@ -1,109 +1,170 @@
+using System.Text;
+using System.Threading.RateLimiting;
+using API.Configuration;
+using API.Health;
 using Application.Interfaces;
 using Application.Services;
 using Infrastructure.Data;
 using Infrastructure.Email;
 using Infrastructure.Jwt;
 using Infrastructure.Repositories;
-using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Extensions.Options;
 using Microsoft.IdentityModel.Tokens;
-using System.Text;
 
 var builder = WebApplication.CreateBuilder(args);
-var configuracion = builder.Configuration;
+var connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
 
-// Add services to the container.
-builder.Services.AddDbContext<AuthDbContext>(option =>
-    option.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection")));
+if (string.IsNullOrWhiteSpace(connectionString))
+    throw new InvalidOperationException(
+        "ConnectionStrings:DefaultConnection must be provided through environment configuration.");
+
+var isDevelopment = builder.Environment.IsDevelopment();
+
+builder.Services.AddProblemDetails();
+builder.Services.AddDbContext<AuthDbContext>(options =>
+{
+    options.UseNpgsql(
+        connectionString,
+        npgsqlOptions =>
+        {
+            npgsqlOptions.EnableRetryOnFailure(
+                maxRetryCount: 5,
+                maxRetryDelay: TimeSpan.FromSeconds(10),
+                errorCodesToAdd: null);
+        });
+});
 
 builder.Services.AddScoped<IUserRepository, UserRepository>();
 builder.Services.AddScoped<IEmailSender, ConsoleEmailSender>();
 builder.Services.AddScoped<IJwt, Jwt>();
-builder.Services.AddScoped<AuthenticationService>();
 builder.Services.AddScoped<IAuthService, AuthService>();
 
-// Memory Cache
-builder.Services.AddMemoryCache();
+builder.Services
+    .AddOptions<JwtOptions>()
+    .BindConfiguration(JwtOptions.SectionName)
+    .Validate(
+        options => options.Key.Length >= JwtOptions.MinimumKeyLength,
+        $"Jwt:Key must be at least {JwtOptions.MinimumKeyLength} characters long.")
+    .Validate(
+        options => !string.IsNullOrWhiteSpace(options.Issuer),
+        "Jwt:Issuer is required.")
+    .Validate(
+        options => !string.IsNullOrWhiteSpace(options.Audience),
+        "Jwt:Audience is required.")
+    .Validate(
+        options => options.AccessTokenMinutes is > 0 and <= 60,
+        "Jwt:AccessTokenMinutes must be between 1 and 60.")
+    .ValidateOnStart();
 
-// Jwt
-var jwt = configuracion.GetSection("Jwt");
-var key = Encoding.UTF8.GetBytes(jwt.GetValue<string>("Key")!);
-
-builder.Services.AddAuthentication(options =>
-{
-    options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
-    options.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;
-})
-    .AddJwtBearer(options =>
+builder.Services
+    .AddAuthentication(options =>
     {
-        options.RequireHttpsMetadata = false;
-        options.SaveToken = true;
+        options.DefaultAuthenticateScheme =
+            JwtBearerDefaults.AuthenticationScheme;
+
+        options.DefaultChallengeScheme =
+            JwtBearerDefaults.AuthenticationScheme;
+    })
+    .AddJwtBearer();
+
+builder.Services
+    .AddOptions<JwtBearerOptions>(JwtBearerDefaults.AuthenticationScheme)
+    .Configure<IOptions<JwtOptions>>((options, jwtOptions) =>
+    {
+        var jwt = jwtOptions.Value;
+        options.RequireHttpsMetadata = !isDevelopment;
+        options.SaveToken = false;
+
         options.TokenValidationParameters = new TokenValidationParameters
         {
             ValidateIssuer = true,
             ValidateAudience = true,
             ValidateLifetime = true,
             ValidateIssuerSigningKey = true,
-            ValidIssuer = jwt.GetValue<string>("Issuer"),
-            ValidAudience = jwt.GetValue<string>("Audience"),
-            IssuerSigningKey = new SymmetricSecurityKey(key)
+            ValidIssuer = jwt.Issuer,
+            ValidAudience = jwt.Audience,
+            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwt.Key)),
+            ClockSkew = TimeSpan.FromSeconds(30)
         };
     });
 
 builder.Services.AddAuthorization();
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    options.GlobalLimiter =
+        PartitionedRateLimiter.Create<HttpContext, string>(
+            httpContext =>
+            {
+                var ipAddress =
+                    httpContext.Connection.RemoteIpAddress?.ToString()
+                    ?? "unknown";
+
+                return RateLimitPartition.GetFixedWindowLimiter(
+                    ipAddress,
+                    _ => new FixedWindowRateLimiterOptions
+                    {
+                        PermitLimit = 200,
+                        Window = TimeSpan.FromMinutes(1),
+                        QueueLimit = 0,
+                        AutoReplenishment = true
+                    });
+            });
+});
+
+builder.Services.AddHealthChecks()
+    .AddCheck<DatabaseHealthCheck>(
+        "database",
+        tags: new[] { "ready" });
 
 builder.Services.AddControllers();
-// Learn more about configuring Swagger/OpenAPI at https://aka.ms/aspnetcore/swashbuckle
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
 var app = builder.Build();
 
-using (var scope = app.Services.CreateScope())
+if (app.Configuration.GetValue<bool>("Database:ApplyMigrationsOnStartup"))
 {
-    var context = scope.ServiceProvider.GetRequiredService<AuthDbContext>();
-    context.Database.Migrate();
+    await using var scope = app.Services.CreateAsyncScope();
+    var dbContext = scope.ServiceProvider.GetRequiredService<AuthDbContext>();
+    await dbContext.Database.MigrateAsync();
 }
 
-// Configure the HTTP request pipeline.
-if (app.Environment.IsDevelopment())
+app.UseExceptionHandler();
+
+if (app.Configuration.GetValue<bool>("HttpsRedirection:Enabled"))
+    app.UseHttpsRedirection();
+
+if (app.Environment.IsDevelopment() && app.Configuration.GetValue("OpenApi:Enabled", defaultValue: true))
 {
     app.UseSwagger();
     app.UseSwaggerUI();
 }
 
-app.UseHttpsRedirection();
-
-// rate limiting
-app.Use(async (context, next) =>
-{
-    var cache = context.RequestServices.GetRequiredService<IMemoryCache>();
-    var ip = context.Connection.RemoteIpAddress?.ToString() ?? "Unknown";
-    var keyIp = $"rl_{ip}";
-    var attempts = cache.Get<int>(keyIp);
-
-    attempts++;
-    cache.Set(keyIp, attempts, TimeSpan.FromMinutes(1));
-
-    if (attempts > 200)
-    {
-        context.Response.StatusCode = 429;
-        await context.Response.WriteAsJsonAsync(new
-        {
-            message = "Too many requests"
-        });
-        return;
-    }
-
-    await next();
-});
-
+app.UseRateLimiter();
 app.UseAuthentication();
-
 app.UseAuthorization();
 
-app.MapControllers();
+app.MapHealthChecks(
+    "/health/live",
+    new HealthCheckOptions
+    {
+        Predicate = _ => false
+    });
 
+app.MapHealthChecks(
+    "/health/ready",
+    new HealthCheckOptions
+    {
+        Predicate = check => check.Tags.Contains("ready")
+    });
+
+app.MapControllers();
 app.Run();
+
+public partial class Program
+{
+}
