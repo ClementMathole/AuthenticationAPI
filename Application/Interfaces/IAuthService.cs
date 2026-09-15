@@ -7,6 +7,6 @@ namespace Application.Interfaces
         Task RegisterAsync(RegisterRequest request);
         Task<AuthResponse> LoginAsync(LoginRequest request, string ip);
         Task<AuthResponse> RefreshAsync(RefreshRequest request);
-        Task RevokeAsync(RevokeRequest request);
+        Task RevokeAsync(RevokeRequest request, Guid authenticatedUserId);
     }
 }

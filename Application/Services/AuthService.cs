@@ -71,7 +71,6 @@ namespace Application.Services
             await _user.UpdateAsync(user);
 
             var access = _jwt.GenerateToken(user);
-
             var refresh = new RefreshToken
             {
                 Token = Convert.ToBase64String(RandomNumberGenerator.GetBytes(64)),
@@ -79,19 +78,18 @@ namespace Application.Services
                 Expires = DateTime.UtcNow.AddDays(7),
             };
             await _user.AddRefreshTokenAync(refresh);
-
             return new AuthResponse(access, refresh.Token);
         }
 
         public async Task<AuthResponse> RefreshAsync(RefreshRequest request)
         {
             var storedToken = await _user.GetRefreshTokenAsync(request.RefreshToken);
-            if (storedToken == null || storedToken.Expires < DateTime.UtcNow)
+            if (storedToken is null || storedToken.Revoked || storedToken.Expires <= DateTime.UtcNow)
                 throw new UnauthorizedAccessException("Invalid refresh token");
 
             await _user.RevokeRefreshTokenAsync(storedToken);
-
             var user = await _user.GetByIdAsync(storedToken.UserId);
+
             if (user == null)
                 throw new UnauthorizedAccessException("Invalid token owner");
 
@@ -107,16 +105,14 @@ namespace Application.Services
             await _user.AddRefreshTokenAync(newRefreshToken);
             storedToken.ReplacedBy = newRefreshToken.Token;
             await _user.RevokeRefreshTokenAsync(storedToken);
-
             return new AuthResponse(access, newRefreshToken.Token);
         }
 
-        public async Task RevokeAsync(RevokeRequest request)
+        public async Task RevokeAsync(RevokeRequest request, Guid authenticatedUserId)
         {
             var storedToken = await _user.GetRefreshTokenAsync(request.RevokeToken);
-            if (storedToken == null)
+            if (storedToken is null || storedToken.UserId != authenticatedUserId || storedToken.Revoked)
                 return;
-
             await _user.RevokeRefreshTokenAsync(storedToken);
         }
     }

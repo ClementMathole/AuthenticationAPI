@@ -5,6 +5,7 @@ using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Identity.Data;
 using Microsoft.AspNetCore.Mvc;
+using System.Security.Claims;
 using static Application.DTOs.AuthDtos;
 using LoginRequest = Application.DTOs.AuthDtos.LoginRequest;
 using RefreshRequest = Application.DTOs.AuthDtos.RefreshRequest;
@@ -36,12 +37,17 @@ namespace API.Controllers
         public async Task<IActionResult> Confirm([FromQuery] Guid userId, [FromQuery] string token)
         {
             var rt = await _user.GetRefreshTokenAsync(token);
-            if (rt == null || rt.UserId != userId) return BadRequest(new { message = "Invalid token" });
+            if (rt is null || rt.UserId != userId || rt.Revoked || rt.Expires <= DateTime.UtcNow)
+                return BadRequest(new { message = "Invalid or expired token" });
+
             var user = await _user.GetByIdAsync(userId);
-            if (user == null) return NotFound();
+            if (user == null)
+                return NotFound();
+
             user.EmailConfirmed = true;
             await _user.UpdateAsync(user);
             await _user.RevokeRefreshTokenAsync(rt);
+
             return Ok(new { message = "Email confirmed" });
         }
 
@@ -80,10 +86,14 @@ namespace API.Controllers
 
         [Authorize]
         [HttpPost("revoke")]
-        public async Task<IActionResult> Revoke(RevokeRequest req)
+        public async Task<IActionResult> Revoke(RevokeRequest request)
         {
-            await _service.RevokeAsync(req);
-            return Ok(new { message = "Revoked (if existed)" });
+            var subject = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+            if (!Guid.TryParse(subject, out var authenticatedUserId) || authenticatedUserId == Guid.Empty)
+                return Unauthorized();
+
+            await _service.RevokeAsync(request, authenticatedUserId);
+            return NoContent();
         }
 
         [Authorize]
