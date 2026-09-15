@@ -42,6 +42,8 @@ services:
         Database=${POSTGRES_DB};
         Username=${POSTGRES_USER};
         Password=${POSTGRES_PASSWORD}
+        GSS Encryption Mode=Disable;
+        Timeout=60
 
       Jwt__Key: ${JWT_KEY:?Set JWT_KEY in .env}
       Jwt__Issuer: ${JWT_ISSUER:-AuthenticationAPI}
