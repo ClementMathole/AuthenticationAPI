@@ -41,7 +41,7 @@ services:
         Port=5432;
         Database=${POSTGRES_DB};
         Username=${POSTGRES_USER};
-        Password=${POSTGRES_PASSWORD}
+        Password=${POSTGRES_PASSWORD};
         GSS Encryption Mode=Disable;
         Timeout=60
 
