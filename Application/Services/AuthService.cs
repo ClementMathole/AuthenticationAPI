@@ -1,119 +1,102 @@
-﻿using Application.Interfaces;
+﻿using Application.DTOs;
+using Application.Exceptions;
+using Application.Interfaces;
+using Application.Security;
 using Domain.Entities;
-using System.Security.Cryptography;
 using static Application.DTOs.AuthDtos;
 
-namespace Application.Services
+namespace Application.Services;
+
+public sealed class AuthService(IUserRepository users, IJwt jwt, IEmailSender email, TimeProvider clock) : IAuthService
 {
-    public class AuthService : IAuthService
+    private static readonly string DummyHash = BCrypt.Net.BCrypt.HashPassword("dummy-verification-value", workFactor: 11);
+
+    public async Task RegisterAsync(RegisterRequest request, CancellationToken ct = default)
     {
-        private readonly IUserRepository _user;
-        private readonly IJwt _jwt;
-        private readonly IEmailSender _email;
+        var address = request.Email.Trim();
+        if (await users.GetByEmailAsync(address, ct) is not null)
+            return;
 
-        public AuthService(IUserRepository user, IJwt jwt, IEmailSender email)
+        var user = new User
         {
-            _user = user;
-            _jwt = jwt;
-            _email = email;
-        }
+            Id = Guid.NewGuid(),
+            Email = address,
+            Username = request.Username.Trim(),
+            PasswordHash = BCrypt.Net.BCrypt.HashPassword(request.Password, workFactor: 11)
+        };
 
-        public async Task RegisterAsync(RegisterRequest request)
-        {
-            var exists = await _user.GetByEmailAsync(request.Email);
-            if (exists != null)
-                throw new InvalidOperationException("Email alredy registered");
-
-            var user = new User
-            {
-                Email = request.Email,
-                Username = request.Username,
-                PasswordHash = BCrypt.Net.BCrypt.HashPassword(request.Password)
-            };
-            await _user.AddAsync(user);
-
-            var token = Convert.ToBase64String(RandomNumberGenerator.GetBytes(64));
-            var refreshToken = new RefreshToken
-            {
-                Token = token,
-                UserId = user.Id,
-                Expires = DateTime.UtcNow.AddHours(24)
-            };
-            await _user.AddRefreshTokenAync(refreshToken);
-
-            var link = $"/api/authentication/confirm?userId={user.Id}&token={Uri.EscapeDataString(token)}";
-            await _email.SendEmailAsync(user.Email, "Confirm your account", $"Click to confirm: {link}");
-        }
-
-        public async Task<AuthResponse> LoginAsync(LoginRequest request, string ip)
-        {
-            var user = await _user.GetByEmailAsync(request.Email);
-            if (user == null)
-                throw new UnauthorizedAccessException("Invalid credentials");
-
-            if (user.LockoutEnd.HasValue && user.LockoutEnd.Value > DateTime.UtcNow)
-                throw new InvalidOperationException($"Account has been locked, wait until {user.LockoutEnd.Value:u}");
-
-            if (!BCrypt.Net.BCrypt.Verify(request.Password, user.PasswordHash))
-            {
-                user.FailedLoginAttempts++;
-                if (user.FailedLoginAttempts >= 5)
-                {
-                    user.LockoutEnd = DateTime.UtcNow.AddMinutes(15);
-                    user.FailedLoginAttempts = 0;
-                }
-                await _user.UpdateAsync(user);
-                throw new UnauthorizedAccessException("Invalid credentials");
-            }
-
-            user.FailedLoginAttempts = 0;
-            user.LockoutEnd = null;
-            await _user.UpdateAsync(user);
-
-            var access = _jwt.GenerateToken(user);
-            var refresh = new RefreshToken
-            {
-                Token = Convert.ToBase64String(RandomNumberGenerator.GetBytes(64)),
-                UserId = user.Id,
-                Expires = DateTime.UtcNow.AddDays(7),
-            };
-            await _user.AddRefreshTokenAync(refresh);
-            return new AuthResponse(access, refresh.Token);
-        }
-
-        public async Task<AuthResponse> RefreshAsync(RefreshRequest request)
-        {
-            var storedToken = await _user.GetRefreshTokenAsync(request.RefreshToken);
-            if (storedToken is null || storedToken.Revoked || storedToken.Expires <= DateTime.UtcNow)
-                throw new UnauthorizedAccessException("Invalid refresh token");
-
-            await _user.RevokeRefreshTokenAsync(storedToken);
-            var user = await _user.GetByIdAsync(storedToken.UserId);
-
-            if (user == null)
-                throw new UnauthorizedAccessException("Invalid token owner");
-
-            var access = _jwt.GenerateToken(user);
-            var newRefreshToken = new RefreshToken
-            {
-                Token = Convert.ToBase64String(RandomNumberGenerator.GetBytes(64)),
-                UserId = user.Id,
-                Expires = DateTime.UtcNow.AddDays(7),
-                ReplacedBy = null
-            };
-
-            await _user.AddRefreshTokenAync(newRefreshToken);
-            storedToken.ReplacedBy = newRefreshToken.Token;
-            await _user.RevokeRefreshTokenAsync(storedToken);
-            return new AuthResponse(access, newRefreshToken.Token);
-        }
-
-        public async Task RevokeAsync(RevokeRequest request, Guid authenticatedUserId)
-        {
-            var storedToken = await _user.GetRefreshTokenAsync(request.RevokeToken);
-            if (storedToken is null || storedToken.UserId != authenticatedUserId || storedToken.Revoked)
-                return;
-            await _user.RevokeRefreshTokenAsync(storedToken);
-        }
+        var token = OpaqueToken.Create(OpaqueToken.ConfirmationPurpose);
+        await users.RegisterAsync(user, token.Hash, ct);
+        await email.SendConfirmationAsync(address, user.Id, token.Value, ct);
     }
+
+    public async Task ResendConfirmationAsync(ResendConfirmationRequest request, CancellationToken ct = default)
+    {
+        var user = await users.GetByEmailAsync(request.Email.Trim(), ct);
+        var address = user?.Email;
+
+        if (user is null || user.EmailConfirmed || string.IsNullOrWhiteSpace(address))
+            return;
+
+        var token = OpaqueToken.Create(OpaqueToken.ConfirmationPurpose);
+        if (await users.IssueConfirmationAsync(user.Id, token.Hash, ct))
+            await email.SendConfirmationAsync(address, user.Id, token.Value, ct);
+    }
+
+    public Task<bool> ConfirmEmailAsync(Guid userId, string token, CancellationToken ct = default)
+    {
+        var hash = OpaqueToken.Hash(token, OpaqueToken.ConfirmationPurpose);
+        return userId == Guid.Empty || hash is null
+            ? Task.FromResult(false)
+            : users.ConfirmEmailAsync(userId, hash, ct);
+    }
+
+    public async Task<AuthResponse> LoginAsync(LoginRequest request, CancellationToken ct = default)
+    {
+        var user = await users.GetByEmailAsync(request.Email.Trim(), ct);
+        if (user?.LockoutEnd > clock.GetUtcNow().UtcDateTime)
+            throw new AccountLockedException();
+
+        var hasPassword = !string.IsNullOrWhiteSpace(user?.PasswordHash);
+        var validPassword = BCrypt.Net.BCrypt.Verify(
+            request.Password,
+            hasPassword ? user!.PasswordHash! : DummyHash);
+
+        if (user is null || !hasPassword || !validPassword)
+        {
+            if (user is not null && await users.RecordFailedLoginAsync(user.Id, ct))
+                throw new AccountLockedException();
+            throw new UnauthorizedAccessException();
+        }
+
+        if (!user.EmailConfirmed)
+            throw new UnauthorizedAccessException();
+
+        var token = OpaqueToken.Create(OpaqueToken.RefreshPurpose);
+        var session = await users.CreateSessionAsync(user.Id, token.Hash, ct) ?? throw new UnauthorizedAccessException();
+        return Response(session, token.Value);
+    }
+
+    public async Task<AuthResponse> RefreshAsync(RefreshRequest request, CancellationToken ct = default)
+    {
+        var hash = OpaqueToken.Hash(request.RefreshToken, OpaqueToken.RefreshPurpose) ?? throw new UnauthorizedAccessException();
+        var replacement = OpaqueToken.Create(OpaqueToken.RefreshPurpose);
+        var session = await users.RotateRefreshTokenAsync(hash, replacement.Hash, ct) ?? throw new UnauthorizedAccessException();
+
+        return Response(session, replacement.Value);
+    }
+
+    public Task RevokeAsync(RevokeRequest request, Guid authenticatedUserId, CancellationToken ct = default)
+    {
+        var hash = OpaqueToken.Hash(request.RevokeToken, OpaqueToken.RefreshPurpose);
+        return hash is null
+            ? Task.CompletedTask
+            : users.RevokeSessionAsync(authenticatedUserId, hash, ct);
+    }
+
+    private AuthResponse Response(AuthenticatedSession session, string refreshToken)
+        => new(jwt.GenerateToken(session.User, session.SessionId),
+                refreshToken,
+                ExpiresIn: jwt.AccessTokenMinutes * 60
+              );
 }

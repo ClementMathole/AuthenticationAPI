@@ -1,7 +1,12 @@
-﻿namespace Application.Interfaces
+﻿namespace Application.Interfaces;
+
+public interface IEmailSender
 {
-    public interface IEmailSender
-    {
-        Task SendEmailAsync(string to, string subject, string body);
-    }
+    Task SendConfirmationAsync
+    (
+        string email,
+        Guid userId,
+        string token,
+        CancellationToken ct = default
+    );
 }

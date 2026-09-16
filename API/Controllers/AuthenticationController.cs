@@ -1,114 +1,119 @@
-﻿using Application.Interfaces;
-using Application.Services;
-using Domain.Entities;
-using Microsoft.AspNetCore.Authentication;
+﻿using Application.Exceptions;
+using Application.Interfaces;
 using Microsoft.AspNetCore.Authorization;
-using Microsoft.AspNetCore.Identity.Data;
 using Microsoft.AspNetCore.Mvc;
-using System.Security.Claims;
 using static Application.DTOs.AuthDtos;
-using LoginRequest = Application.DTOs.AuthDtos.LoginRequest;
-using RefreshRequest = Application.DTOs.AuthDtos.RefreshRequest;
-using RegisterRequest = Application.DTOs.AuthDtos.RegisterRequest;
 
-namespace API.Controllers
+namespace API.Controllers;
+
+[ApiController]
+[Route("api/authentication")]
+[ResponseCache(NoStore = true, Location = ResponseCacheLocation.None)]
+public sealed class AuthenticationController(IAuthService service, IUserRepository users) : ControllerBase
 {
-    [ApiController]
-    [Route("api/[controller]")]
-    public class AuthenticationController : ControllerBase
+    [HttpPost("register")]
+    public async Task<IActionResult> Register(RegisterRequest request, CancellationToken ct)
     {
-        private readonly IAuthService _service;
-        private readonly IUserRepository _user;
-
-        public AuthenticationController(IAuthService service, IUserRepository user)
+        await service.RegisterAsync(request, ct);
+        return Accepted(new
         {
-            _service = service;
-            _user = user;
-        }
+            message = "If registration is available, a confirmation email has been sent."
+        });
+    }
 
-        [HttpPost("Register")]
-        public async Task<IActionResult> Register(RegisterRequest request)
+    [HttpPost("resend-confirmation")]
+    public async Task<IActionResult> ResendConfirmation(ResendConfirmationRequest request, CancellationToken ct)
+    {
+        await service.ResendConfirmationAsync(request, ct);
+        return Accepted(new
         {
-            await _service.RegisterAsync(request);
-            return Accepted(new { message = "Registered Successfully, Confirm Email" });
-        }
+            message = "If confirmation is needed, a new email has been sent."
+        });
+    }
 
-        [HttpGet("confirm")]
-        public async Task<IActionResult> Confirm([FromQuery] Guid userId, [FromQuery] string token)
-        {
-            var rt = await _user.GetRefreshTokenAsync(token);
-            if (rt is null || rt.UserId != userId || rt.Revoked || rt.Expires <= DateTime.UtcNow)
-                return BadRequest(new { message = "Invalid or expired token" });
-
-            var user = await _user.GetByIdAsync(userId);
-            if (user == null)
-                return NotFound();
-
-            user.EmailConfirmed = true;
-            await _user.UpdateAsync(user);
-            await _user.RevokeRefreshTokenAsync(rt);
-
-            return Ok(new { message = "Email confirmed" });
-        }
-
-        [HttpPost("login")]
-        public async Task<IActionResult> Login(LoginRequest req)
-        {
-            var ip = HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
-            try
+    [HttpGet("confirm")]
+    public async Task<IActionResult> Confirm([FromQuery] Guid userId, [FromQuery] string token, CancellationToken ct)
+    {
+        Response.Headers["Referrer-Policy"] = "no-referrer";
+        if (!await service.ConfirmEmailAsync(userId, token, ct))
+            return BadRequest(new
             {
-                var auth = await _service.LoginAsync(req, ip);
-                return Ok(auth);
-            }
-            catch (InvalidOperationException ex)
-            {
-                return StatusCode(423, new { message = ex.Message });
-            }
-            catch (UnauthorizedAccessException)
-            {
-                return Unauthorized(new { message = "Invalid credentials" });
-            }
-        }
+                message = "Invalid or expired confirmation token"
+            });
 
-        [HttpPost("refresh")]
-        public async Task<IActionResult> Refresh(RefreshRequest req)
+        return Ok(new { message = "Email confirmed" });
+    }
+
+    [HttpPost("login")]
+    public async Task<IActionResult> Login(LoginRequest request, CancellationToken ct)
+    {
+        try
         {
-            try
-            {
-                var auth = await _service.RefreshAsync(req);
-                return Ok(auth);
-            }
-            catch (UnauthorizedAccessException)
-            {
-                return Unauthorized(new { message = "Invalid or expired refresh token" });
-            }
+            return Ok(await service.LoginAsync(request, ct));
         }
-
-        [Authorize]
-        [HttpPost("revoke")]
-        public async Task<IActionResult> Revoke(RevokeRequest request)
+        catch (AccountLockedException)
         {
-            var subject = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
-            if (!Guid.TryParse(subject, out var authenticatedUserId) || authenticatedUserId == Guid.Empty)
-                return Unauthorized();
-
-            await _service.RevokeAsync(request, authenticatedUserId);
-            return NoContent();
+            return StatusCode(423, new
+            {
+                message = "Account temporarily locked. Try again later."
+            });
         }
-
-        [Authorize]
-        [HttpGet("me")]
-        public async Task<IActionResult> Me()
+        catch (UnauthorizedAccessException)
         {
-            var email = User?.Identity?.Name;
-            if (email == null)
-                return Unauthorized();
-
-            var u = await _user.GetByEmailAsync(email);
-            if (u == null)
-                return NotFound();
-
-            return Ok(new { u.Id, u.Email, u.Username, u.Role });
+            return Unauthorized(new
+            {
+                message = "Invalid credentials or account not confirmed"
+            });
         }
     }
+
+    [HttpPost("refresh")]
+    public async Task<IActionResult> Refresh(RefreshRequest request, CancellationToken ct)
+    {
+        try
+        {
+            return Ok(await service.RefreshAsync(request, ct));
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return Unauthorized(new
+            {
+                message = "Invalid or expired refresh token"
+            });
+        }
+    }
+
+    [Authorize]
+    [HttpPost("revoke")]
+    public async Task<IActionResult> Revoke(RevokeRequest request, CancellationToken ct)
+    {
+        if (!TryGetUserId(out var userId))
+            return Unauthorized();
+
+        await service.RevokeAsync(request, userId, ct);
+        return NoContent();
+    }
+
+    [Authorize]
+    [HttpGet("me")]
+    public async Task<IActionResult> Me(CancellationToken ct)
+    {
+        if (!TryGetUserId(out var userId))
+            return Unauthorized();
+
+        var user = await users.GetByIdAsync(userId, ct);
+        if (user is null)
+            return Unauthorized();
+
+        return Ok(new
+        {
+            user.Id,
+            user.Email,
+            user.Username,
+            role = user.Role.ToString()
+        });
+    }
+
+    private bool TryGetUserId(out Guid userId)
+        => Guid.TryParse(User.FindFirst("sub")?.Value, out userId) && userId != Guid.Empty;
 }

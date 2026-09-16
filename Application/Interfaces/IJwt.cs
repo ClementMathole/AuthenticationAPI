@@ -1,10 +1,9 @@
 ﻿using Domain.Entities;
 
-namespace Application.Interfaces
+namespace Application.Interfaces;
+
+public interface IJwt
 {
-    public interface IJwt
-    {
-        string GenerateToken(User user);
-        int AccessTokenMinutes { get; }
-    }
+    string GenerateToken(User user, Guid sessionId);
+    int AccessTokenMinutes { get; }
 }
